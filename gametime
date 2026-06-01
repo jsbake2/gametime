@@ -358,6 +358,49 @@ def swap_usage_pct() -> tuple[float, int, int]:
     return (used / total) * 100.0, used, total
 
 
+def mem_available_kb() -> int:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return 0
+
+
+def flush_swap(used_kb: int, dry_run: bool) -> bool:
+    """Run swapoff -a && swapon -a via sudo (after confirming RAM can absorb it).
+
+    Returns True if swap was flushed (or would be, in dry-run), False otherwise.
+    """
+    available = mem_available_kb()
+    # Leave a 1 GiB buffer so the system doesn't OOM during the swapoff.
+    safety_margin_kb = 1024 * 1024
+    if available < used_kb + safety_margin_kb:
+        warn(f"swap flush skipped: only {available//1024} MiB available, would need "
+             f"{(used_kb + safety_margin_kb)//1024} MiB to absorb current swap safely")
+        return False
+    if dry_run:
+        info(f"[dry-run] would flush {used_kb//1024} MiB of swap via 'sudo swapoff -a && sudo swapon -a'")
+        return True
+    info(f"flushing {used_kb//1024} MiB of swap (sudo may prompt for password)…")
+    try:
+        # swapoff can take a while if it has to page a lot back in — give it 5 minutes.
+        subprocess.run(["sudo", "-p", "[sudo] password to flush swap: ", "swapoff", "-a"],
+                       check=True, timeout=300)
+        subprocess.run(["sudo", "swapon", "-a"], check=True, timeout=60)
+        ok("swap flushed")
+        return True
+    except subprocess.CalledProcessError as e:
+        err(f"swap flush failed: {e}")
+    except subprocess.TimeoutExpired:
+        err("swap flush timed out — system may be very low on RAM")
+    except FileNotFoundError:
+        err("sudo not found")
+    return False
+
+
 def find_hung_procs() -> tuple[list[Proc], list[Proc], dict[int, int]]:
     """Return (zombies, d_state, ppid_count_for_zombies).
 
@@ -622,24 +665,18 @@ def cmd_on(args) -> int:
         color = C.RED if pct >= cfg["swap_warn_pct"] else (C.YELLOW if pct >= 10 else C.GREEN)
         print(f"   swap: {color}{pct:5.1f}%{C.RESET} ({used_kb//1024} / {total_kb//1024} MiB)")
         if pct >= cfg["swap_warn_pct"]:
-            warn("Swap is heavy. Run as root to flush:  sudo swapoff -a && sudo swapon -a")
-            if os.geteuid() == 0 and ask_yes_no("Flush swap now?", default=False):
-                try:
-                    subprocess.run(["swapoff", "-a"], check=True)
-                    subprocess.run(["swapon", "-a"], check=True)
-                    ok("Swap flushed.")
-                except subprocess.CalledProcessError as e:
-                    err(f"swap flush failed: {e}")
+            flush_swap(used_kb, dry_run=args.dry_run)
     zombies, d_state, ppid_count = find_hung_procs()
     if zombies:
         top_parents = sorted(ppid_count.items(), key=lambda x: -x[1])[:3]
         # Only nag if a single parent leaked a lot or there's a serious pile.
         worst = top_parents[0][1] if top_parents else 0
         if worst >= 20 or len(zombies) >= 50:
-            warn(f"{len(zombies)} zombie process(es). Likely culprit parents:")
+            warn(f"{len(zombies)} zombie process(es) accumulated under:")
             for ppid, n in top_parents:
-                print(f"   ppid={ppid} ({_proc_name_for_pid(ppid)}): {n} zombies — "
-                      f"restart this process to reap them")
+                pname = _proc_name_for_pid(ppid)
+                print(f"   {pname} (pid {ppid}): {n} zombies")
+            print(f"   {C.DIM}(zombies cost a PID slot each but no CPU; only the parent can reap them){C.RESET}")
         else:
             print(f"   zombies: {len(zombies)} (harmless background noise)")
     if d_state:
