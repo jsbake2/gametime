@@ -24,9 +24,10 @@ gametime on                                    # interactive
 gametime on --yes --launcher steam --no-ai     # silent: nuke everything in the list, keep steam, skip AI
 gametime on --dry-run                          # show what would happen, change nothing
 
-gametime off                                   # ask: default apps, previous session, or both
-gametime off --default
-gametime off --previous
+gametime off                                   # ask A / B / C
+gametime off -A                                # A: relaunch what 'on' killed
+gametime off -B                                # B: launch the default off-list
+gametime off -C                                # C: pick from a combined menu
 
 gametime status                                # show config + last session
 ```
@@ -54,12 +55,13 @@ gametime status                                # show config + last session
 
 Restarts apps. You get three options each run:
 
-- **default** — the apps listed in `default_apps.json` (Teams DPG, Teams ICR,
-  Google Chat, YouTube Music, VS Code by default).
-- **previous** — whatever was running before the last `gametime on`. For
-  `teams-for-linux` instances we look at the `--user-data-dir` flag and pick
-  the right wrapper (`teams-dpg` / `teams-icr`).
-- **both** — fire all of them.
+- **A — previous session.** Whatever was running before the last `gametime on`.
+  For `teams-for-linux` instances we read the `--user-data-dir` flag from the
+  saved cmdline and pick the right wrapper (`teams-dpg` / `teams-icr`).
+- **B — defaults.** The apps listed in `default_apps.json` (Teams DPG, Teams
+  ICR, Google Chat, YouTube Music, VS Code by default).
+- **C — pick.** A combined menu of (A) and (B), de-duplicated. Enter a
+  selection like `1,3,5-7` or `all` to launch only the ones you want.
 
 ## Config
 
