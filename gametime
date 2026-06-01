@@ -57,7 +57,7 @@ DEFAULT_WHITELIST = {
         "chrome", "google-chrome", "chromium",
         "youtube-music",
         "appg",
-        "google-chat",
+        "google-chat", "google-chat-linux",
         # Critical system things that should NEVER be killed.
         "systemd", "init", "kthread", "kworker", "kwin", "kwin_x11", "kwin_wayland",
         "plasmashell", "Xorg", "Xwayland", "gdm", "sddm", "lightdm",
@@ -73,7 +73,7 @@ DEFAULT_APPS = {
     "apps": [
         {"name": "Teams DPG", "command": "teams-dpg"},
         {"name": "Teams ICR", "command": "teams-icr"},
-        {"name": "Google Chat", "command": "xdg-open https://chat.google.com"},
+        {"name": "Google Chat", "command": "google-chat-linux"},
         {"name": "YouTube Music", "command": "youtube-music"},
         {"name": "VS Code", "command": "code"},
     ],
