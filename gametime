@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+"""gametime — switch the workstation between focused-gaming and back-to-work modes.
+
+Usage:
+    gametime on    [--yes] [--no-ai] [--launcher steam|battlenet|none]
+    gametime off   [--default | --previous]
+    gametime status
+
+Config lives in ~/.config/gametime/ as JSON. Edit freely; the tool reloads each run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+CONFIG_DIR = Path(os.environ.get("GAMETIME_CONFIG_DIR", Path.home() / ".config" / "gametime"))
+KILLLIST_FILE = CONFIG_DIR / "killlist.json"
+WHITELIST_FILE = CONFIG_DIR / "whitelist.json"
+DEFAULT_APPS_FILE = CONFIG_DIR / "default_apps.json"
+LAST_SESSION_FILE = CONFIG_DIR / "last_session.json"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+DEFAULT_KILLLIST = {
+    "processes": [
+        "teams-for-linux",
+        "firefox",
+        "nautilus", "thunar", "dolphin", "nemo", "pcmanfm", "caja",
+        "code", "code-insiders", "code-oss",
+        "slack", "discord",
+        "thunderbird", "evolution", "geary",
+        "dropbox", "insync", "nextcloud",
+        "zoom", "skypeforlinux",
+        "spotify",
+        "obsidian", "notion-app", "joplin",
+        "pycharm", "idea", "rubymine", "webstorm", "goland", "clion",
+        "docker-desktop",
+        "keybase",
+    ],
+    # Patterns matched against the full /proc/PID/cmdline (regex). Use sparingly.
+    "cmdline_patterns": [],
+}
+
+DEFAULT_WHITELIST = {
+    "processes": [
+        "chrome", "google-chrome", "chromium",
+        "youtube-music",
+        "appg",
+        "google-chat",
+        # Critical system things that should NEVER be killed.
+        "systemd", "init", "kthread", "kworker", "kwin", "kwin_x11", "kwin_wayland",
+        "plasmashell", "Xorg", "Xwayland", "gdm", "sddm", "lightdm",
+        "gnome-shell", "gnome-session", "pulseaudio", "pipewire", "wireplumber",
+        "bash", "zsh", "fish", "tmux", "ssh", "sshd",
+        "kitty", "alacritty", "konsole", "gnome-terminal",
+        "claude", "node",
+    ],
+    "cmdline_patterns": [],
+}
+
+DEFAULT_APPS = {
+    "apps": [
+        {"name": "Teams DPG", "command": "teams-dpg"},
+        {"name": "Teams ICR", "command": "teams-icr"},
+        {"name": "Google Chat", "command": "xdg-open https://chat.google.com"},
+        {"name": "YouTube Music", "command": "youtube-music"},
+        {"name": "VS Code", "command": "code"},
+    ],
+}
+
+DEFAULT_CONFIG = {
+    "high_cpu_threshold_pct": 30.0,   # whitelist warning threshold
+    "high_mem_threshold_pct": 8.0,
+    "swap_warn_pct": 25.0,
+    "ai": {
+        "enabled": True,
+        # How to talk to the Ollama container at 10.0.0.16:
+        # we ssh to the host and curl the container's docker-bridge IP.
+        "ssh_host": "jbaker@10.0.0.16",
+        "ollama_url": "http://172.23.0.2:11434",
+        "model": "qwen2.5:14b",
+        "timeout_seconds": 45,
+    },
+    "launchers": {
+        # Used when 'on' is asked which launcher to keep.
+        "steam": ["steam"],
+        "battlenet": ["battle.net", "Battle.net", "battlenet", "lutris"],
+    },
+}
+
+# ───────────────────────────── ANSI / output ─────────────────────────────
+
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+
+
+def banner(text: str) -> None:
+    bar = "═" * (len(text) + 4)
+    print(f"\n{C.CYAN}{bar}{C.RESET}")
+    print(f"{C.CYAN}║ {C.BOLD}{text}{C.RESET}{C.CYAN} ║{C.RESET}")
+    print(f"{C.CYAN}{bar}{C.RESET}")
+
+
+def info(s: str) -> None: print(f"{C.BLUE}ℹ {C.RESET}{s}")
+def ok(s: str) -> None: print(f"{C.GREEN}✓ {C.RESET}{s}")
+def warn(s: str) -> None: print(f"{C.YELLOW}⚠ {C.RESET}{s}")
+def err(s: str) -> None: print(f"{C.RED}✗ {C.RESET}{s}", file=sys.stderr)
+
+
+def ask(prompt: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        ans = input(f"{C.BOLD}?{C.RESET} {prompt}{suffix}: ").strip()
+    except EOFError:
+        return default or ""
+    return ans or (default or "")
+
+
+def ask_yes_no(prompt: str, default: bool = False) -> bool:
+    default_str = "Y/n" if default else "y/N"
+    ans = ask(prompt, default_str).lower()
+    if ans in ("y", "yes"): return True
+    if ans in ("n", "no"): return False
+    return default
+
+
+# ───────────────────────────── Config I/O ─────────────────────────────
+
+def _load_json(path: Path, default: dict) -> dict:
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(default, indent=2))
+        return json.loads(json.dumps(default))  # deep copy
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        err(f"{path} is not valid JSON: {e}")
+        sys.exit(2)
+
+
+def _save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def load_killlist() -> dict: return _load_json(KILLLIST_FILE, DEFAULT_KILLLIST)
+def load_whitelist() -> dict: return _load_json(WHITELIST_FILE, DEFAULT_WHITELIST)
+def load_default_apps() -> dict: return _load_json(DEFAULT_APPS_FILE, DEFAULT_APPS)
+def load_config() -> dict:
+    cfg = _load_json(CONFIG_FILE, DEFAULT_CONFIG)
+    # Fill in missing keys from defaults (forward compat as we add config).
+    def _merge(base, over):
+        for k, v in base.items():
+            if k not in over: over[k] = v
+            elif isinstance(v, dict) and isinstance(over[k], dict): _merge(v, over[k])
+        return over
+    return _merge(DEFAULT_CONFIG, cfg)
+
+
+# ───────────────────────────── /proc inspection ─────────────────────────────
+
+@dataclass
+class Proc:
+    pid: int
+    ppid: int
+    comm: str           # /proc/PID/comm (kernel-truncated name, ≤15 chars)
+    exe: str            # resolved /proc/PID/exe (may be empty)
+    cmdline: str        # joined argv
+    state: str          # R/S/D/Z/T
+    rss_kb: int         # resident memory
+    cpu_pct: float = 0.0  # filled in by sampler
+
+    @property
+    def name(self) -> str:
+        # Prefer the exe basename when present, else comm.
+        if self.exe:
+            return Path(self.exe).name
+        return self.comm
+
+
+def _read_proc(pid: int) -> Proc | None:
+    base = Path(f"/proc/{pid}")
+    try:
+        with (base / "stat").open() as f:
+            stat = f.read()
+        # /proc/PID/stat: pid (comm) state ...  comm may contain parens/spaces.
+        rparen = stat.rfind(")")
+        if rparen < 0: return None
+        comm = stat[stat.find("(") + 1:rparen]
+        rest = stat[rparen + 2:].split()
+        state = rest[0]
+        ppid = int(rest[1])
+        cmdline = (base / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        try:
+            exe = os.readlink(base / "exe")
+        except OSError:
+            exe = ""
+        rss_kb = 0
+        try:
+            with (base / "status").open() as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        rss_kb = int(line.split()[1]); break
+        except OSError:
+            pass
+        return Proc(pid=pid, ppid=ppid, comm=comm, exe=exe, cmdline=cmdline, state=state, rss_kb=rss_kb)
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+
+
+def iter_procs() -> Iterable[Proc]:
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit(): continue
+        p = _read_proc(int(entry))
+        if p: yield p
+
+
+def sample_cpu(duration: float = 0.4) -> dict[int, float]:
+    """Sample %CPU per pid via /proc/PID/stat utime+stime delta."""
+    def snapshot() -> tuple[float, dict[int, int]]:
+        wall = time.monotonic()
+        cputime = {}
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit(): continue
+            try:
+                with open(f"/proc/{entry}/stat") as f:
+                    parts = f.read().split()
+                # utime=14, stime=15 (1-indexed in proc(5)); but parts[0]=pid, so utime=parts[13]
+                cputime[int(entry)] = int(parts[13]) + int(parts[14])
+            except (FileNotFoundError, IndexError, ValueError, ProcessLookupError):
+                continue
+        return wall, cputime
+    t1, snap1 = snapshot()
+    time.sleep(duration)
+    t2, snap2 = snapshot()
+    hz = os.sysconf("SC_CLK_TCK")
+    elapsed = max(t2 - t1, 0.001)
+    cores = os.cpu_count() or 1
+    pcts: dict[int, float] = {}
+    for pid, t in snap2.items():
+        if pid in snap1:
+            delta_ticks = t - snap1[pid]
+            pct = (delta_ticks / hz / elapsed) * 100.0 / cores
+            pcts[pid] = max(0.0, pct)
+    return pcts
+
+
+def total_mem_kb() -> int:
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1])
+    return 0
+
+
+# ───────────────────────────── Matching / killing ─────────────────────────────
+
+def _matches_name(proc: Proc, names: list[str]) -> str | None:
+    """Match a process against a list of names. Returns the name that matched, or None."""
+    cands = {proc.comm.lower(), proc.name.lower()}
+    if proc.exe: cands.add(Path(proc.exe).name.lower())
+    # Also consider argv[0]
+    if proc.cmdline:
+        first = proc.cmdline.split(" ", 1)[0]
+        cands.add(Path(first).name.lower())
+    for n in names:
+        nl = n.lower()
+        if nl in cands: return n
+        # Allow startswith for common variants like "teams-for-linux" matching "teams-for-linux-helper".
+        for c in cands:
+            if c == nl or c.startswith(nl + "-") or c.startswith(nl + "."):
+                return n
+    return None
+
+
+def _matches_pattern(proc: Proc, patterns: list[str]) -> str | None:
+    for pat in patterns:
+        try:
+            if re.search(pat, proc.cmdline): return pat
+        except re.error:
+            continue
+    return None
+
+
+def find_targets(killlist: dict, whitelist: dict) -> list[tuple[Proc, str]]:
+    """Return [(proc, matched_rule), ...] for processes to kill, excluding whitelist."""
+    targets = []
+    for p in iter_procs():
+        if p.pid == os.getpid(): continue
+        if _matches_name(p, whitelist.get("processes", [])): continue
+        if _matches_pattern(p, whitelist.get("cmdline_patterns", [])): continue
+        match = _matches_name(p, killlist.get("processes", [])) \
+             or _matches_pattern(p, killlist.get("cmdline_patterns", []))
+        if match:
+            targets.append((p, match))
+    return targets
+
+
+def kill_procs(procs: list[Proc], dry_run: bool = False) -> list[dict]:
+    """Send SIGTERM (then SIGKILL after a grace period) to processes. Return what was killed."""
+    killed = []
+    pids = [p.pid for p in procs]
+    for p in procs:
+        record = {"pid": p.pid, "name": p.name, "comm": p.comm, "exe": p.exe, "cmdline": p.cmdline}
+        killed.append(record)
+        if dry_run:
+            info(f"[dry-run] would SIGTERM {p.pid} {p.name}")
+            continue
+        try:
+            os.kill(p.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError) as e:
+            warn(f"SIGTERM {p.pid} {p.name}: {e}")
+    if dry_run: return killed
+    # Grace period, then SIGKILL stragglers.
+    time.sleep(2.0)
+    for pid in pids:
+        if Path(f"/proc/{pid}").exists():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    return killed
+
+
+# ───────────────────────────── System health ─────────────────────────────
+
+def swap_usage_pct() -> tuple[float, int, int]:
+    """Returns (pct_used, used_kb, total_kb)."""
+    total = used = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("SwapTotal:"): total = int(line.split()[1])
+                elif line.startswith("SwapFree:"): free = int(line.split()[1]); used = total - free
+    except OSError:
+        return 0.0, 0, 0
+    if total == 0: return 0.0, 0, 0
+    return (used / total) * 100.0, used, total
+
+
+def find_hung_procs() -> tuple[list[Proc], list[Proc], dict[int, int]]:
+    """Return (zombies, d_state, ppid_count_for_zombies).
+
+    Zombies are usually harmless on their own — what matters is whether a single
+    parent has leaked many of them. We return a ppid histogram so the caller can
+    surface that signal instead of dumping a wall of pids.
+    """
+    zombies: list[Proc] = []
+    d_state: list[Proc] = []
+    ppid_count: dict[int, int] = {}
+    for p in iter_procs():
+        if p.state == "Z":
+            zombies.append(p)
+            ppid_count[p.ppid] = ppid_count.get(p.ppid, 0) + 1
+        elif p.state == "D":
+            d_state.append(p)
+    return zombies, d_state, ppid_count
+
+
+def _proc_name_for_pid(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip()
+    except OSError:
+        return "?"
+
+
+def gpu_status() -> str | None:
+    """Best-effort GPU utilization summary. Returns a string or None if no GPU detected."""
+    if shutil.which("nvidia-smi"):
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+                return " | ".join(lines)
+        except Exception:
+            pass
+    # AMD via sysfs
+    for card in sorted(Path("/sys/class/drm").glob("card[0-9]")):
+        busy = card / "device" / "gpu_busy_percent"
+        if busy.exists():
+            try:
+                return f"AMD {card.name}: {busy.read_text().strip()}% busy"
+            except OSError:
+                pass
+    return None
+
+
+def network_top_kbps(sample_s: float = 0.5) -> list[tuple[str, float, float]]:
+    """Return list of (iface, rx_kbps, tx_kbps) sorted by total throughput."""
+    def read():
+        out = {}
+        with open("/proc/net/dev") as f:
+            for line in f.readlines()[2:]:
+                name, rest = line.split(":", 1)
+                fields = rest.split()
+                out[name.strip()] = (int(fields[0]), int(fields[8]))  # rx_bytes, tx_bytes
+        return out
+    a = read()
+    time.sleep(sample_s)
+    b = read()
+    results = []
+    for iface in a:
+        if iface in ("lo",): continue
+        if iface not in b: continue
+        rx = max(0, (b[iface][0] - a[iface][0])) / sample_s / 1024.0
+        tx = max(0, (b[iface][1] - a[iface][1])) / sample_s / 1024.0
+        if rx + tx > 0.1:
+            results.append((iface, rx, tx))
+    results.sort(key=lambda x: x[1] + x[2], reverse=True)
+    return results
+
+
+def check_whitelisted_high_usage(whitelist: dict, cpu_pcts: dict[int, float],
+                                 cfg: dict) -> list[tuple[Proc, float, float]]:
+    """Return whitelisted procs exceeding CPU/MEM thresholds."""
+    mem_total = total_mem_kb() or 1
+    cpu_thr = cfg["high_cpu_threshold_pct"]
+    mem_thr = cfg["high_mem_threshold_pct"]
+    hot = []
+    for p in iter_procs():
+        if not _matches_name(p, whitelist.get("processes", [])):
+            continue
+        cpu = cpu_pcts.get(p.pid, 0.0)
+        mem_pct = (p.rss_kb / mem_total) * 100.0
+        if cpu >= cpu_thr or mem_pct >= mem_thr:
+            hot.append((p, cpu, mem_pct))
+    hot.sort(key=lambda x: -(x[1] + x[2]))
+    return hot
+
+
+# ───────────────────────────── AI: Qwen via SSH ─────────────────────────────
+
+def qwen_analyze(snapshot: str, cfg: dict) -> str | None:
+    """Send a process snapshot to Qwen2.5; return its recommendation text, or None on failure."""
+    ai = cfg.get("ai", {})
+    if not ai.get("enabled", True): return None
+    if not shutil.which("ssh"):
+        warn("ssh not found — skipping AI analysis"); return None
+
+    prompt = (
+        "You are advising on which Linux processes are safe to kill to free resources for "
+        "gaming. The user is on Arch/CachyOS. Given the snapshot below, list up to 8 process "
+        "names that are safe to terminate (NOT system/desktop critical, NOT shells/terminals, "
+        "NOT the running gametime script itself). Reply as a short bullet list with "
+        "process name + one-sentence reason. Be concise.\n\n"
+        f"SNAPSHOT:\n{snapshot}\n"
+    )
+    payload = json.dumps({
+        "model": ai["model"],
+        "prompt": prompt,
+        "stream": False,
+        "options": {"num_predict": 400, "temperature": 0.2},
+    })
+    cmd = [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+        ai["ssh_host"],
+        f"curl -s --max-time {int(ai['timeout_seconds'])} {ai['ollama_url']}/api/generate -d @-",
+    ]
+    try:
+        r = subprocess.run(cmd, input=payload, capture_output=True, text=True,
+                           timeout=ai["timeout_seconds"] + 10)
+    except subprocess.TimeoutExpired:
+        warn("Qwen request timed out"); return None
+    except FileNotFoundError:
+        warn("ssh missing"); return None
+    if r.returncode != 0:
+        warn(f"Qwen call failed: {r.stderr.strip()[:200]}"); return None
+    try:
+        obj = json.loads(r.stdout)
+        return obj.get("response", "").strip() or None
+    except json.JSONDecodeError:
+        warn("Qwen returned non-JSON"); return None
+
+
+# ───────────────────────────── ON ─────────────────────────────
+
+def cmd_on(args) -> int:
+    cfg = load_config()
+    killlist = load_killlist()
+    whitelist = load_whitelist()
+
+    banner("GAMETIME — ON")
+
+    # 1. Sample CPU first (need a brief window).
+    info("Sampling CPU usage…")
+    cpu_pcts = sample_cpu(duration=0.5)
+
+    # 2. Launcher question.
+    chosen_launcher = (args.launcher or "").lower()
+    if not chosen_launcher:
+        chosen_launcher = ask("Which game launcher are you using? (steam/battlenet/none)", "none").lower()
+    if chosen_launcher not in ("steam", "battlenet", "none", ""):
+        warn(f"Unknown launcher '{chosen_launcher}', treating as 'none'")
+        chosen_launcher = "none"
+    # Build a per-run additional killlist for the unused launcher.
+    extra_kill_names: list[str] = []
+    launchers = cfg.get("launchers", DEFAULT_CONFIG["launchers"])
+    if chosen_launcher == "steam":
+        extra_kill_names.extend(launchers.get("battlenet", []))
+    elif chosen_launcher == "battlenet":
+        extra_kill_names.extend(launchers.get("steam", []))
+    elif chosen_launcher == "none":
+        extra_kill_names.extend(launchers.get("steam", []))
+        extra_kill_names.extend(launchers.get("battlenet", []))
+
+    # 3. Whitelist alerts before we kill anything.
+    hot_whitelisted = check_whitelisted_high_usage(whitelist, cpu_pcts, cfg)
+    if hot_whitelisted:
+        warn("Whitelisted processes are using a lot of resources:")
+        for p, cpu, mem in hot_whitelisted:
+            print(f"   {C.YELLOW}{p.name:25}{C.RESET} pid={p.pid:<7} cpu={cpu:5.1f}%  mem={mem:5.1f}%  "
+                  f"{C.DIM}{p.cmdline[:70]}{C.RESET}")
+        print("   (consider restarting them yourself if performance suffers)\n")
+
+    # 4. Find targets.
+    targets = find_targets(killlist, whitelist)
+    # Add extra launcher kills.
+    if extra_kill_names:
+        ext_list = {"processes": extra_kill_names, "cmdline_patterns": []}
+        for p in iter_procs():
+            if p.pid == os.getpid(): continue
+            if _matches_name(p, whitelist.get("processes", [])): continue
+            if _matches_name(p, extra_kill_names):
+                if not any(t[0].pid == p.pid for t in targets):
+                    targets.append((p, f"unused-launcher:{chosen_launcher}"))
+
+    if targets:
+        info(f"Found {len(targets)} process(es) matching the killlist:")
+        for p, rule in targets:
+            print(f"   {C.RED}{p.name:25}{C.RESET} pid={p.pid:<7} rule={rule:<20} "
+                  f"{C.DIM}{p.cmdline[:60]}{C.RESET}")
+        if not args.yes and not ask_yes_no("Kill these now?", default=True):
+            info("Aborted.")
+            return 1
+        killed_records = kill_procs([p for p, _ in targets], dry_run=args.dry_run)
+    else:
+        info("Nothing in the killlist is currently running.")
+        killed_records = []
+
+    # 5. Top-CPU/MEM candidates not in either list.
+    top_candidates = []
+    for p in iter_procs():
+        if p.pid == os.getpid(): continue
+        if _matches_name(p, whitelist.get("processes", [])): continue
+        if _matches_name(p, killlist.get("processes", [])): continue
+        if p.state == "Z": continue
+        cpu = cpu_pcts.get(p.pid, 0.0)
+        mem = p.rss_kb
+        if cpu >= 5.0 or mem >= 200_000:
+            top_candidates.append((p, cpu, mem))
+    top_candidates.sort(key=lambda x: -(x[1] * 10 + (x[2] / 1024 / 100)))
+    top_candidates = top_candidates[:12]
+
+    ai_text = None
+    if not args.no_ai and cfg["ai"].get("enabled", True):
+        info("Asking Qwen for a second opinion…")
+        snapshot = "Top processes (not on any list):\n" + "\n".join(
+            f"  {p.name:25} pid={p.pid:<7} cpu={cpu:5.1f}% rss={mem//1024:5d}MB  {p.cmdline[:80]}"
+            for p, cpu, mem in top_candidates
+        )
+        ai_text = qwen_analyze(snapshot, cfg)
+        if ai_text:
+            print(f"\n{C.MAGENTA}── Qwen2.5 says ──{C.RESET}")
+            print(ai_text)
+            print(f"{C.MAGENTA}──────────────────{C.RESET}\n")
+
+    if top_candidates and not args.yes:
+        info("Top resource users not in any list:")
+        for i, (p, cpu, mem) in enumerate(top_candidates, 1):
+            print(f"  {i:2}. {p.name:25} pid={p.pid:<7} cpu={cpu:5.1f}%  rss={mem//1024:5d}MB  "
+                  f"{C.DIM}{p.cmdline[:60]}{C.RESET}")
+        sel = ask("Kill any of these? Enter numbers (e.g. '1,3,5'), 'all', or blank to skip", "")
+        chosen = set()
+        if sel.lower() == "all":
+            chosen = set(range(1, len(top_candidates) + 1))
+        elif sel:
+            for tok in sel.replace(",", " ").split():
+                if tok.isdigit() and 1 <= int(tok) <= len(top_candidates):
+                    chosen.add(int(tok))
+        if chosen:
+            to_kill = [top_candidates[i - 1][0] for i in sorted(chosen)]
+            killed_records.extend(kill_procs(to_kill, dry_run=args.dry_run))
+            if ask_yes_no("Add these to the persistent killlist so they're killed automatically next time?",
+                          default=True):
+                kill_names = killlist.setdefault("processes", [])
+                for p in to_kill:
+                    if p.name and p.name not in kill_names:
+                        kill_names.append(p.name)
+                        ok(f"Added '{p.name}' to killlist")
+                _save_json(KILLLIST_FILE, killlist)
+
+    # 6. System health.
+    print()
+    info("System health:")
+    pct, used_kb, total_kb = swap_usage_pct()
+    if total_kb:
+        color = C.RED if pct >= cfg["swap_warn_pct"] else (C.YELLOW if pct >= 10 else C.GREEN)
+        print(f"   swap: {color}{pct:5.1f}%{C.RESET} ({used_kb//1024} / {total_kb//1024} MiB)")
+        if pct >= cfg["swap_warn_pct"]:
+            warn("Swap is heavy. Run as root to flush:  sudo swapoff -a && sudo swapon -a")
+            if os.geteuid() == 0 and ask_yes_no("Flush swap now?", default=False):
+                try:
+                    subprocess.run(["swapoff", "-a"], check=True)
+                    subprocess.run(["swapon", "-a"], check=True)
+                    ok("Swap flushed.")
+                except subprocess.CalledProcessError as e:
+                    err(f"swap flush failed: {e}")
+    zombies, d_state, ppid_count = find_hung_procs()
+    if zombies:
+        top_parents = sorted(ppid_count.items(), key=lambda x: -x[1])[:3]
+        # Only nag if a single parent leaked a lot or there's a serious pile.
+        worst = top_parents[0][1] if top_parents else 0
+        if worst >= 20 or len(zombies) >= 50:
+            warn(f"{len(zombies)} zombie process(es). Likely culprit parents:")
+            for ppid, n in top_parents:
+                print(f"   ppid={ppid} ({_proc_name_for_pid(ppid)}): {n} zombies — "
+                      f"restart this process to reap them")
+        else:
+            print(f"   zombies: {len(zombies)} (harmless background noise)")
+    if d_state:
+        warn(f"{len(d_state)} process(es) in D state (uninterruptible IO — possible hang):")
+        for p in d_state[:5]:
+            print(f"   pid={p.pid} {p.name} {C.DIM}{p.cmdline[:60]}{C.RESET}")
+    g = gpu_status()
+    if g: print(f"   gpu : {g}")
+    net = network_top_kbps()
+    if net:
+        top = net[0]
+        print(f"   net : {top[0]} rx={top[1]:.0f} KiB/s tx={top[2]:.0f} KiB/s")
+
+    # 7. Save session (skip on dry-run so 'off' isn't fed phantom data).
+    if not args.dry_run:
+        session = {
+            "started": time.time(),
+            "launcher": chosen_launcher,
+            "killed": killed_records,
+        }
+        _save_json(LAST_SESSION_FILE, session)
+    print()
+    verb = "would terminate" if args.dry_run else "terminated"
+    ok(f"Gametime engaged. {len(killed_records)} process(es) {verb}. Have fun.")
+    return 0
+
+
+# ───────────────────────────── OFF ─────────────────────────────
+
+def relaunch(cmd: str) -> bool:
+    """Spawn a command fully detached. Returns True if Popen succeeded."""
+    if not cmd: return False
+    try:
+        subprocess.Popen(
+            cmd, shell=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception as e:
+        warn(f"failed to launch '{cmd}': {e}")
+        return False
+
+
+def _cmd_for_killed_record(rec: dict) -> str | None:
+    """Translate a killed-process record back into a relaunch command."""
+    cmdline = rec.get("cmdline") or ""
+    name = (rec.get("name") or "").lower()
+    # Special case: teams-for-linux instances → use the dpg/icr wrapper scripts.
+    if "teams-for-linux" in name or "teams-for-linux" in cmdline:
+        m = re.search(r"--user-data-dir=\S*teams-for-linux-(\w+)", cmdline)
+        if m:
+            variant = m.group(1).lower()
+            if variant == "dpg" and shutil.which("teams-dpg"): return "teams-dpg"
+            if variant == "icr" and shutil.which("teams-icr"): return "teams-icr"
+        return None  # don't relaunch a raw teams-for-linux without args
+    # Default: re-run argv as-is if the binary still resolves.
+    if cmdline:
+        argv0 = cmdline.split(" ", 1)[0]
+        if Path(argv0).is_absolute() and Path(argv0).exists():
+            return cmdline
+        bin_name = Path(argv0).name
+        if bin_name and shutil.which(bin_name):
+            return cmdline
+    if rec.get("exe") and Path(rec["exe"]).exists():
+        return rec["exe"]
+    if name and shutil.which(name):
+        return name
+    return None
+
+
+def cmd_off(args) -> int:
+    cfg = load_config()
+    default_apps = load_default_apps()
+    banner("GAMETIME — OFF")
+
+    last = _load_json(LAST_SESSION_FILE, {"killed": []}) if LAST_SESSION_FILE.exists() else {"killed": []}
+    previous = []
+    for rec in last.get("killed", []):
+        cmd = _cmd_for_killed_record(rec)
+        if cmd: previous.append((rec.get("name") or rec.get("comm") or "?", cmd))
+    # Deduplicate by name, keep first.
+    seen = set(); previous_uniq = []
+    for n, c in previous:
+        if n in seen: continue
+        seen.add(n); previous_uniq.append((n, c))
+
+    choice = "default"
+    if args.previous: choice = "previous"
+    elif args.default: choice = "default"
+    elif previous_uniq:
+        print("\nPreviously running (would relaunch):")
+        for n, c in previous_uniq:
+            print(f"   • {n}  {C.DIM}({c}){C.RESET}")
+        print("\nDefault apps:")
+        for app in default_apps["apps"]:
+            print(f"   • {app['name']}  {C.DIM}({app['command']}){C.RESET}")
+        ans = ask("Launch [d]efault apps, [p]revious, or [b]oth?", "d").lower()
+        choice = {"d": "default", "p": "previous", "b": "both"}.get(ans, "default")
+    else:
+        info("No previous session recorded — launching defaults.")
+
+    launched = 0
+    if choice in ("default", "both"):
+        for app in default_apps["apps"]:
+            if relaunch(app["command"]):
+                ok(f"launched {app['name']}"); launched += 1
+    if choice in ("previous", "both"):
+        for n, c in previous_uniq:
+            if relaunch(c):
+                ok(f"relaunched {n}"); launched += 1
+
+    print()
+    ok(f"Welcome back. {launched} app(s) launching.")
+    return 0
+
+
+# ───────────────────────────── STATUS ─────────────────────────────
+
+def cmd_status(args) -> int:
+    cfg = load_config()
+    killlist = load_killlist()
+    whitelist = load_whitelist()
+    banner("GAMETIME — STATUS")
+    print(f"Config dir       : {CONFIG_DIR}")
+    print(f"Killlist entries : {len(killlist.get('processes', []))}")
+    print(f"Whitelist entries: {len(whitelist.get('processes', []))}")
+    print(f"AI enabled       : {cfg['ai'].get('enabled')} ({cfg['ai'].get('ssh_host')} → {cfg['ai'].get('model')})")
+    if LAST_SESSION_FILE.exists():
+        last = _load_json(LAST_SESSION_FILE, {})
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last.get("started", 0)))
+        print(f"Last session     : {when}  launcher={last.get('launcher')}  killed={len(last.get('killed', []))}")
+    return 0
+
+
+# ───────────────────────────── main ─────────────────────────────
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="gametime", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="mode", required=True)
+
+    p_on = sub.add_parser("on", help="enter gaming mode")
+    p_on.add_argument("--yes", "-y", action="store_true", help="don't prompt; kill everything matched")
+    p_on.add_argument("--no-ai", action="store_true", help="skip Qwen analysis")
+    p_on.add_argument("--launcher", choices=["steam", "battlenet", "none"], help="game launcher to keep")
+    p_on.add_argument("--dry-run", action="store_true", help="don't actually kill anything")
+    p_on.set_defaults(func=cmd_on)
+
+    p_off = sub.add_parser("off", help="leave gaming mode")
+    p_off.add_argument("--default", action="store_true", help="launch default app set")
+    p_off.add_argument("--previous", action="store_true", help="launch previously-killed apps")
+    p_off.set_defaults(func=cmd_off)
+
+    p_status = sub.add_parser("status", help="show current config and last session")
+    p_status.set_defaults(func=cmd_status)
+
+    args = ap.parse_args()
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print()
+        err("Interrupted.")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
