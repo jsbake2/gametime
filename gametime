@@ -370,27 +370,90 @@ def mem_available_kb() -> int:
     return 0
 
 
-def flush_swap(used_kb: int, dry_run: bool) -> bool:
-    """Run swapoff -a && swapon -a via sudo (after confirming RAM can absorb it).
+def zram_orig_compressed_kb() -> tuple[int, int]:
+    """Sum (uncompressed_kb, compressed_kb) across all zram devices.
 
-    Returns True if swap was flushed (or would be, in dry-run), False otherwise.
+    Reads /sys/block/zramN/mm_stat: fields are orig_data_size, compr_data_size,
+    mem_used_total, ... — all in bytes.
     """
-    available = mem_available_kb()
-    # Leave a 1 GiB buffer so the system doesn't OOM during the swapoff.
-    safety_margin_kb = 1024 * 1024
-    if available < used_kb + safety_margin_kb:
-        warn(f"swap flush skipped: only {available//1024} MiB available, would need "
-             f"{(used_kb + safety_margin_kb)//1024} MiB to absorb current swap safely")
-        return False
-    if dry_run:
-        info(f"[dry-run] would flush {used_kb//1024} MiB of swap via 'sudo swapoff -a && sudo swapon -a'")
-        return True
-    info(f"flushing {used_kb//1024} MiB of swap (sudo may prompt for password)…")
+    orig = comp = 0
+    for stat in Path("/sys").glob("block/zram*/mm_stat"):
+        try:
+            parts = stat.read_text().split()
+            orig += int(parts[0]) // 1024
+            comp += int(parts[1]) // 1024
+        except (OSError, IndexError, ValueError):
+            continue
+    return orig, comp
+
+
+def swap_backends() -> list[tuple[str, str, int]]:
+    """Read /proc/swaps. Returns list of (filename, kind, size_kb).
+
+    kind is 'zram', 'partition', or 'file'.
+    """
+    out: list[tuple[str, str, int]] = []
     try:
-        # swapoff can take a while if it has to page a lot back in — give it 5 minutes.
-        subprocess.run(["sudo", "-p", "[sudo] password to flush swap: ", "swapoff", "-a"],
-                       check=True, timeout=300)
-        subprocess.run(["sudo", "swapon", "-a"], check=True, timeout=60)
+        with open("/proc/swaps") as f:
+            next(f, None)  # header
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3: continue
+                name, _type, size = parts[0], parts[1], int(parts[2])
+                if "zram" in name: kind = "zram"
+                elif _type == "partition": kind = "partition"
+                else: kind = "file"
+                out.append((name, kind, size))
+    except OSError:
+        pass
+    return out
+
+
+def flush_swap(used_kb: int, dry_run: bool) -> bool:
+    """Reclaim swap. Behaves differently depending on backend:
+
+    - Pure zram (CachyOS-style): flushing is counter-productive — the data
+      will just get re-compressed minutes later as swappiness=100+ pushes
+      cold anon pages back in. We skip and explain.
+    - Real swap partition/file: 'sudo swapoff -a && sudo swapon -a' is the
+      right fix, gated on MemAvailable so it can't OOM the box.
+    - Mixed (zram + real swap): only touch the real backends so zram-generator
+      stays happy.
+
+    Returns True if action was taken (or would be, in dry-run).
+    """
+    backends = swap_backends()
+    zram = [b for b in backends if b[1] == "zram"]
+    real = [b for b in backends if b[1] != "zram"]
+
+    if not real and zram:
+        info(f"swap is backed entirely by zram ({sum(b[2] for b in zram)//1024} MiB compressed). "
+             "Flushing would just re-compress the same pages — skipping.")
+        return False
+    if not backends:
+        warn("no swap configured")
+        return False
+
+    available = mem_available_kb()
+    real_used_kb = sum(b[2] for b in real)
+    safety_margin_kb = 1024 * 1024  # 1 GiB headroom so swapoff can't OOM us.
+    if available < real_used_kb + safety_margin_kb:
+        warn(f"swap flush skipped: only {available//1024} MiB available, would need "
+             f"{(real_used_kb + safety_margin_kb)//1024} MiB to absorb the real-swap pages safely")
+        return False
+
+    if dry_run:
+        info(f"[dry-run] would swapoff/swapon real backends: "
+             + ", ".join(b[0] for b in real))
+        return True
+
+    info(f"flushing {real_used_kb//1024} MiB from real swap "
+         f"({', '.join(b[0] for b in real)})… (sudo may prompt)")
+    try:
+        for name, _, _ in real:
+            subprocess.run(["sudo", "-p", "[sudo] password to flush swap: ",
+                            "swapoff", name], check=True, timeout=300)
+            subprocess.run(["sudo", "swapon", name], check=True, timeout=60)
         ok("swap flushed")
         return True
     except subprocess.CalledProcessError as e:
@@ -663,10 +726,21 @@ def cmd_on(args) -> int:
     info("System health:")
     pct, used_kb, total_kb = swap_usage_pct()
     if total_kb:
-        color = C.RED if pct >= cfg["swap_warn_pct"] else (C.YELLOW if pct >= 10 else C.GREEN)
-        print(f"   swap: {color}{pct:5.1f}%{C.RESET} ({used_kb//1024} / {total_kb//1024} MiB)")
-        if pct >= cfg["swap_warn_pct"]:
-            flush_swap(used_kb, dry_run=args.dry_run)
+        backends = swap_backends()
+        zram_only = backends and all(b[1] == "zram" for b in backends)
+        if zram_only:
+            orig, comp = zram_orig_compressed_kb()
+            ratio = (orig / comp) if comp else 0.0
+            color = C.GREEN if comp < 2 * 1024 * 1024 else (C.YELLOW if comp < 4 * 1024 * 1024 else C.RED)
+            print(f"   swap: zram {used_kb//1024} MiB compressed → "
+                  f"{color}{comp//1024} MiB{C.RESET} in real RAM "
+                  f"(ratio {ratio:.1f}×) — this is compressed RAM, not disk")
+            # No flush on pure-zram: would just re-compress the same pages.
+        else:
+            color = C.RED if pct >= cfg["swap_warn_pct"] else (C.YELLOW if pct >= 10 else C.GREEN)
+            print(f"   swap: {color}{pct:5.1f}%{C.RESET} ({used_kb//1024} / {total_kb//1024} MiB)")
+            if pct >= cfg["swap_warn_pct"]:
+                flush_swap(used_kb, dry_run=args.dry_run)
     zombies, d_state, ppid_count = find_hung_procs()
     if zombies:
         top_parents = sorted(ppid_count.items(), key=lambda x: -x[1])[:3]
